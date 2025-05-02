@@ -147,35 +147,35 @@ impl AttentionWeights {
     ) -> Result<Self> {
         let num_kv_groups = num_heads / num_kv_heads;
 
-        // Load QTensor weights and create QMatMul wrappers
+        // Load QTensor weights and convert to QMatMul wrappers
         let q_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.q_proj.weight"),
+            &format!("{prefix}.attn_q.weight"),
             device,
         )?)?;
         let k_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.k_proj.weight"),
+            &format!("{prefix}.attn_k.weight"),
             device,
         )?)?;
         let v_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.v_proj.weight"),
+            &format!("{prefix}.attn_v.weight"),
             device,
         )?)?;
         let o_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.o_proj.weight"),
+            &format!("{prefix}.attn_output.weight"),
             device,
         )?)?;
 
-        // Load QTensor norm weights and create RmsNorm instances
+        // Load QTensor norm weights
         let q_norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, &format!("{prefix}.q_norm.weight"), device)?,
+            ct.tensor(reader, &format!("{prefix}.attn_q_norm.weight"), device)?,
             rms_norm_eps,
         )?;
         let k_norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, &format!("{prefix}.k_norm.weight"), device)?,
+            ct.tensor(reader, &format!("{prefix}.attn_k_norm.weight"), device)?,
             rms_norm_eps,
         )?;
 
@@ -361,19 +361,16 @@ impl LayerWeights {
         layer_idx: usize,
         device: &Device,
     ) -> Result<Self> {
-        let prefix = format!("model.layers.{layer_idx}");
+        // Update prefix to use the blk.X format shown in the GGUF output
+        let prefix = format!("blk.{layer_idx}");
 
-        // RmsNorms take QTensor weights
+        // RmsNorms take QTensor weights - update paths to match GGUF
         let ln1 = RmsNorm::from_qtensor(
-            ct.tensor(reader, &format!("{prefix}.input_layernorm.weight"), device)?,
+            ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?,
             rms_norm_eps,
         )?;
         let ln2 = RmsNorm::from_qtensor(
-            ct.tensor(
-                reader,
-                &format!("{prefix}.post_attention_layernorm.weight"),
-                device,
-            )?,
+            ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?,
             rms_norm_eps,
         )?;
 
@@ -387,10 +384,10 @@ impl LayerWeights {
             hidden_size,
             rms_norm_eps,
             rotary,
-            &format!("{prefix}.self_attn"),
+            &prefix,
             device,
         )?;
-        let mlp = MlpWeights::new(ct, reader, &format!("{prefix}.mlp"), device)?;
+        let mlp = MlpWeights::new(ct, reader, &prefix, device)?;
 
         Ok(Self {
             self_attn,
@@ -590,7 +587,7 @@ impl ModelWeights {
 
         // Load final norm
         let norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, "model.norm.weight", device)?,
+            ct.tensor(reader, "output_norm.weight", device)?,
             rms_norm_eps,
         )?;
 
