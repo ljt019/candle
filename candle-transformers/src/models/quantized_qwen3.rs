@@ -487,7 +487,38 @@ impl ModelWeights {
                 }
             }
         }
+
+        // Print tensor names to help find embeddings
+        println!("\nTensors in the model file:");
+        let mut tensor_names: Vec<String> = ct.tensor_infos.keys().cloned().collect();
+        tensor_names.sort();
+
+        let possible_embedding_names = [
+            "token_embd.weight",
+            "model.embed_tokens.weight",
+            "embedding.weight",
+            "embed_tokens.weight",
+            "token_embeddings.weight",
+        ];
+
+        let mut embedding_tensor_name = "token_embd.weight"; // Default to common GGUF name
+
+        for name in &tensor_names {
+            // Print tensor info
+            if let Some(info) = ct.tensor_infos.get(name) {
+                let shape_str = format!("{:?}", &info.shape);
+                println!("  {} - {}", name, shape_str);
+
+                // Try to identify embedding tensor by checking for known names
+                if possible_embedding_names.contains(&name.as_str()) {
+                    embedding_tensor_name = name;
+                    println!("    ^ Likely embedding tensor");
+                }
+            }
+        }
         println!("===========================");
+
+        println!("Using embedding tensor: {}", embedding_tensor_name);
 
         // Follow gemma3's approach strictly - use md_get with bail on missing
         let md_get = |s: &str| match ct.metadata.get(s) {
@@ -516,8 +547,8 @@ impl ModelWeights {
             None => DType::F16, // Default to F16 if missing
         };
 
-        // Load embeddings
-        let embed_tensor = ct.tensor(reader, "model.embed_tokens.weight", device)?;
+        // Load embeddings using the name we found
+        let embed_tensor = ct.tensor(reader, embedding_tensor_name, device)?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
 
         // Create rotary embedding
@@ -563,10 +594,13 @@ impl ModelWeights {
             rms_norm_eps,
         )?;
 
-        // Check if lm_head.weight exists
+        // Check if lm_head.weight exists, otherwise use embedding weights
         let lm_head_tensor = match ct.tensor_infos.contains_key("lm_head.weight") {
             true => ct.tensor(reader, "lm_head.weight", device)?,
-            false => ct.tensor(reader, "model.embed_tokens.weight", device)?, // Fallback to tied weights
+            false => {
+                println!("lm_head.weight not found, using embeddings for output projection");
+                ct.tensor(reader, embedding_tensor_name, device)?
+            }
         };
         let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
 
