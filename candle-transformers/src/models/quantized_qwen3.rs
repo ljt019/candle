@@ -298,25 +298,23 @@ impl MlpWeights {
         prefix: &str,
         device: &Device,
     ) -> Result<Self> {
+        // Use the correct ffn_ prefix tensor names from GGUF
         let gate_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.gate_proj.weight"),
+            &format!("{prefix}.ffn_gate.weight"),
             device,
         )?)?;
         let up_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.up_proj.weight"),
+            &format!("{prefix}.ffn_up.weight"),
             device,
         )?)?;
         let down_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
-            &format!("{prefix}.down_proj.weight"),
+            &format!("{prefix}.ffn_down.weight"),
             device,
         )?)?;
-        // Activation function is part of the config, need to get it from there.
-        // For now, we'll assume SwiGLU is handled by the sequence gate*up.
-        // A proper config would pass the activation function type.
-        // Based on Qwen3 SwiGLU: silu(gate) * up
+
         let act_fn = Activation::Silu; // SwiGLU uses SiLU
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         Ok(Self {
