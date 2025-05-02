@@ -103,67 +103,9 @@ impl Qwen3RotaryEmbedding {
     }
 }
 
-// Quantized MLP using QMatMul
+// Rename QuantizedQwen3Attention to AttentionWeights for consistency
 #[derive(Debug, Clone)]
-pub(crate) struct QuantizedQwen3MLP {
-    gate_proj: QMatMulWrapper,
-    up_proj: QMatMulWrapper,
-    down_proj: QMatMulWrapper,
-    act_fn: Activation,
-    span: tracing::Span,
-}
-
-impl QuantizedQwen3MLP {
-    pub(crate) fn new<R: Read + Seek>(
-        ct: &gguf_file::Content,
-        reader: &mut R,
-        prefix: &str,
-        device: &Device,
-    ) -> Result<Self> {
-        let gate_proj = QMatMulWrapper::from_qtensor(ct.tensor(
-            reader,
-            &format!("{prefix}.gate_proj.weight"),
-            device,
-        )?)?;
-        let up_proj = QMatMulWrapper::from_qtensor(ct.tensor(
-            reader,
-            &format!("{prefix}.up_proj.weight"),
-            device,
-        )?)?;
-        let down_proj = QMatMulWrapper::from_qtensor(ct.tensor(
-            reader,
-            &format!("{prefix}.down_proj.weight"),
-            device,
-        )?)?;
-        // Activation function is part of the config, need to get it from there.
-        // For now, we'll assume SwiGLU is handled by the sequence gate*up.
-        // A proper config would pass the activation function type.
-        // Based on Qwen3 SwiGLU: silu(gate) * up
-        let act_fn = Activation::Silu; // SwiGLU uses SiLU
-        let span = tracing::span!(tracing::Level::TRACE, "mlp");
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn, // Storing as Silu, but the forward impl does gate * up
-            span,
-        })
-    }
-}
-
-impl Module for QuantizedQwen3MLP {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?; // Apply SiLU to gate
-        let up = self.up_proj.forward(x)?;
-        let gated = (gate * up)?; // SwiGLU combine
-        self.down_proj.forward(&gated)
-    }
-}
-
-// Quantized Attention using QMatMul and quantized RmsNorm
-#[derive(Debug, Clone)]
-pub(crate) struct QuantizedQwen3Attention {
+pub(crate) struct AttentionWeights {
     // projections
     q_proj: QMatMulWrapper,
     k_proj: QMatMulWrapper,
@@ -184,7 +126,7 @@ pub(crate) struct QuantizedQwen3Attention {
     span_attn: tracing::Span,
 }
 
-impl QuantizedQwen3Attention {
+impl AttentionWeights {
     pub(crate) fn new<R: Read + Seek>(
         ct: &gguf_file::Content,
         reader: &mut R,
@@ -334,16 +276,74 @@ impl QuantizedQwen3Attention {
     }
 }
 
-// Quantized Decoder Layer
+// Rename MLP struct
 #[derive(Debug, Clone)]
-struct QuantizedDecoderLayer {
-    self_attn: QuantizedQwen3Attention,
-    mlp: QuantizedQwen3MLP,
+pub(crate) struct MlpWeights {
+    gate_proj: QMatMulWrapper,
+    up_proj: QMatMulWrapper,
+    down_proj: QMatMulWrapper,
+    act_fn: Activation,
+    span: tracing::Span,
+}
+
+impl MlpWeights {
+    pub(crate) fn new<R: Read + Seek>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        prefix: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        let gate_proj = QMatMulWrapper::from_qtensor(ct.tensor(
+            reader,
+            &format!("{prefix}.gate_proj.weight"),
+            device,
+        )?)?;
+        let up_proj = QMatMulWrapper::from_qtensor(ct.tensor(
+            reader,
+            &format!("{prefix}.up_proj.weight"),
+            device,
+        )?)?;
+        let down_proj = QMatMulWrapper::from_qtensor(ct.tensor(
+            reader,
+            &format!("{prefix}.down_proj.weight"),
+            device,
+        )?)?;
+        // Activation function is part of the config, need to get it from there.
+        // For now, we'll assume SwiGLU is handled by the sequence gate*up.
+        // A proper config would pass the activation function type.
+        // Based on Qwen3 SwiGLU: silu(gate) * up
+        let act_fn = Activation::Silu; // SwiGLU uses SiLU
+        let span = tracing::span!(tracing::Level::TRACE, "mlp");
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            act_fn, // Storing as Silu, but the forward impl does gate * up
+            span,
+        })
+    }
+}
+
+impl Module for MlpWeights {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?; // Apply SiLU to gate
+        let up = self.up_proj.forward(x)?;
+        let gated = (gate * up)?; // SwiGLU combine
+        self.down_proj.forward(&gated)
+    }
+}
+
+// Rename QuantizedDecoderLayer to LayerWeights
+#[derive(Debug, Clone)]
+struct LayerWeights {
+    self_attn: AttentionWeights,
+    mlp: MlpWeights,
     ln1: RmsNorm, // Using quantized RmsNorm
     ln2: RmsNorm, // Using quantized RmsNorm
 }
 
-impl QuantizedDecoderLayer {
+impl LayerWeights {
     fn new<R: Read + Seek>(
         ct: &gguf_file::Content,
         reader: &mut R,
@@ -369,7 +369,7 @@ impl QuantizedDecoderLayer {
         )?;
 
         // Attention and MLP constructors take ct, reader, prefix
-        let self_attn = QuantizedQwen3Attention::new(
+        let self_attn = AttentionWeights::new(
             ct,
             reader,
             cfg,
@@ -377,7 +377,7 @@ impl QuantizedDecoderLayer {
             &format!("{prefix}.self_attn"),
             device,
         )?;
-        let mlp = QuantizedQwen3MLP::new(ct, reader, &format!("{prefix}.mlp"), device)?;
+        let mlp = MlpWeights::new(ct, reader, &format!("{prefix}.mlp"), device)?;
 
         Ok(Self {
             self_attn,
@@ -402,18 +402,20 @@ impl QuantizedDecoderLayer {
     }
 }
 
-// Quantized Model
+// Combine QuantizedModel and QuantizedModelForCausalLM into ModelWeights like in gemma3
 #[derive(Debug, Clone)]
-pub struct QuantizedModel {
+pub struct ModelWeights {
     embed_tokens: Embedding, // Embedding is not quantized (weights dequantized)
-    layers: Vec<QuantizedDecoderLayer>,
-    norm: RmsNorm, // Using quantized RmsNorm
+    layers: Vec<LayerWeights>,
+    norm: RmsNorm,           // Using quantized RmsNorm
+    lm_head: QMatMulWrapper, // Include lm_head in the ModelWeights
     device: Device,
     dtype: DType, // Model's computation dtype
     span: tracing::Span,
+    span_output: tracing::Span,
 }
 
-impl QuantizedModel {
+impl ModelWeights {
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -443,7 +445,7 @@ impl QuantizedModel {
         // Load decoder layers
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(QuantizedDecoderLayer::new(
+            layers.push(LayerWeights::new(
                 &ct,
                 reader,
                 cfg,
@@ -459,15 +461,26 @@ impl QuantizedModel {
             cfg.rms_norm_eps,
         )?;
 
+        // Load lm_head weights
+        let lm_head_tensor = if cfg.tie_word_embeddings {
+            ct.tensor(reader, "model.embed_tokens.weight", device)?
+        } else {
+            ct.tensor(reader, "lm_head.weight", device)?
+        };
+        let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
+
         let span = tracing::span!(tracing::Level::TRACE, "model");
+        let span_output = tracing::span!(tracing::Level::TRACE, "output");
 
         Ok(Self {
             embed_tokens,
             layers,
             norm,
+            lm_head,
             device: device.clone(),
             dtype,
             span,
+            span_output,
         })
     }
 
@@ -504,6 +517,7 @@ impl QuantizedModel {
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
+    // Combine forward methods from both previous structs
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
@@ -518,58 +532,15 @@ impl QuantizedModel {
         for layer in &mut self.layers {
             h = layer.forward(&h, causal.as_ref(), offset)?;
         }
-        self.norm.forward(&h)
-    }
-}
 
-// Quantized Model for Causal Language Modeling
-#[derive(Debug, Clone)]
-pub struct QuantizedModelForCausalLM {
-    base: QuantizedModel,
-    lm_head: QMatMulWrapper,
-    span_output: tracing::Span,
-}
+        // Apply final norm to hidden states
+        let h = self.norm.forward(&h)?;
 
-impl QuantizedModelForCausalLM {
-    // Use Read + Seek bounds directly
-    pub fn from_gguf<R: Read + Seek>(
-        ct: gguf_file::Content,
-        reader: &mut R,
-        cfg: &Config,
-        device: &Device,
-    ) -> Result<Self> {
-        // Load lm_head tensor *before* constructing base model
-        let lm_head_tensor = if cfg.tie_word_embeddings {
-            ct.tensor(reader, "model.embed_tokens.weight", device)?
-        } else {
-            ct.tensor(reader, "lm_head.weight", device)?
-        };
-        let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
-
-        // Now construct base model, moving ct
-        let base = QuantizedModel::from_gguf(ct, reader, cfg, device)?;
-
-        let span_output = tracing::span!(tracing::Level::TRACE, "output");
-
-        Ok(Self {
-            base,
-            lm_head,
-            span_output,
-        })
-    }
-
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
-        let hidden_states = self.base.forward(input, offset)?;
-
-        let _enter = self.span_output.enter();
         // Get the last token's hidden state
-        let last_hidden = hidden_states.narrow(1, l - 1, 1)?;
+        let _enter = self.span_output.enter();
+        let last_hidden = h.narrow(1, l - 1, 1)?;
+
         // Project to vocabulary
         self.lm_head.forward(&last_hidden)
-    }
-
-    pub fn clear_kv_cache(&mut self) {
-        self.base.clear_kv_cache();
     }
 }
