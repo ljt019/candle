@@ -270,9 +270,9 @@ impl AttentionWeights {
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
-
-        // 8. Output proj - QMatMul::forward returns Tensor
-        let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?; // Reshape before applying final projection
+        let reshaped_ctx = ctx
+            .transpose(1, 2)?
+            .reshape((b, l, self.num_heads * self.head_dim))?; // Reshape before applying final projection
         self.o_proj.forward(&reshaped_ctx) // Call forward directly
     }
 
