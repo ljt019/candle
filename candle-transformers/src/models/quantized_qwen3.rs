@@ -73,12 +73,18 @@ pub(crate) struct Qwen3RotaryEmbedding {
 }
 
 impl Qwen3RotaryEmbedding {
-    pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.head_dim;
-        let max_seq_len = cfg.max_position_embeddings;
+    pub(crate) fn new(
+        dtype: DType,
+        head_dim: usize,
+        max_position_embeddings: usize,
+        rope_theta: f64,
+        dev: &Device,
+    ) -> Result<Self> {
+        let dim = head_dim;
+        let max_seq_len = max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
@@ -130,19 +136,15 @@ impl AttentionWeights {
     pub(crate) fn new<R: Read + Seek>(
         ct: &gguf_file::Content,
         reader: &mut R,
-        cfg: &Config,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+        rms_norm_eps: f64,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
         prefix: &str,
         device: &Device,
     ) -> Result<Self> {
-        if cfg.use_sliding_window {
-            // Based on the original code's behavior
-            candle::bail!("sliding window is not suppored in this quantized implementation");
-        }
-
-        let head_dim = cfg.head_dim;
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
 
         // Load QTensor weights and create QMatMul wrappers
@@ -170,17 +172,20 @@ impl AttentionWeights {
         // Load QTensor norm weights and create RmsNorm instances
         let q_norm = RmsNorm::from_qtensor(
             ct.tensor(reader, &format!("{prefix}.q_norm.weight"), device)?,
-            cfg.rms_norm_eps,
+            rms_norm_eps,
         )?;
         let k_norm = RmsNorm::from_qtensor(
             ct.tensor(reader, &format!("{prefix}.k_norm.weight"), device)?,
-            cfg.rms_norm_eps,
+            rms_norm_eps,
         )?;
 
-        // Necessary because the hidden_size in the config isn't always accurate
-        let hidden_size = head_dim * cfg.num_attention_heads;
-
-        let kv_cache = KvCache::new(2, cfg.max_position_embeddings);
+        // Get max_position from metadata or use a reasonable default
+        let max_position_embeddings = ct
+            .metadata
+            .get("qwen3.context_length")
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(4096) as usize;
+        let kv_cache = KvCache::new(2, max_position_embeddings);
 
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
@@ -347,7 +352,11 @@ impl LayerWeights {
     fn new<R: Read + Seek>(
         ct: &gguf_file::Content,
         reader: &mut R,
-        cfg: &Config,
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+        rms_norm_eps: f64,
         rotary: Arc<Qwen3RotaryEmbedding>,
         layer_idx: usize,
         device: &Device,
@@ -357,7 +366,7 @@ impl LayerWeights {
         // RmsNorms take QTensor weights
         let ln1 = RmsNorm::from_qtensor(
             ct.tensor(reader, &format!("{prefix}.input_layernorm.weight"), device)?,
-            cfg.rms_norm_eps,
+            rms_norm_eps,
         )?;
         let ln2 = RmsNorm::from_qtensor(
             ct.tensor(
@@ -365,14 +374,18 @@ impl LayerWeights {
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 device,
             )?,
-            cfg.rms_norm_eps,
+            rms_norm_eps,
         )?;
 
         // Attention and MLP constructors take ct, reader, prefix
         let self_attn = AttentionWeights::new(
             ct,
             reader,
-            cfg,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            hidden_size,
+            rms_norm_eps,
             rotary,
             &format!("{prefix}.self_attn"),
             device,
@@ -419,9 +432,31 @@ impl ModelWeights {
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
-        cfg: &Config,
         device: &Device,
     ) -> Result<Self> {
+        // Extract configuration from metadata
+        let md_get = |s: &str| match ct.metadata.get(s) {
+            None => candle::bail!("cannot find {s} in metadata"),
+            Some(v) => Ok(v),
+        };
+
+        // Get required configuration parameters
+        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
+        let num_hidden_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
+        let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
+        let num_key_value_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
+        let head_dim = md_get("qwen3.attention.head_size")?.to_u32()? as usize;
+        let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let rope_theta = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
+        let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
+
+        // Optional parameters with defaults
+        let tie_word_embeddings = ct
+            .metadata
+            .get("qwen3.tied_weights")
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(false);
+
         // Pick computation dtype: F32 if metadata code 0, else F16
         let dtype = ct
             .metadata
@@ -437,18 +472,28 @@ impl ModelWeights {
         // Load embedding weights - dequantize to use in standard Embedding
         let embed_tensor = ct.tensor(reader, "model.embed_tokens.weight", device)?;
         let embed_tensor = embed_tensor.dequantize(device)?;
-        let embed_tokens = Embedding::new(embed_tensor, cfg.hidden_size);
+        let embed_tokens = Embedding::new(embed_tensor, hidden_size);
 
         // Create rotary embedding
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(dtype, cfg, device)?);
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(
+            dtype,
+            head_dim,
+            max_position_embeddings,
+            rope_theta,
+            device,
+        )?);
 
         // Load decoder layers
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
+        let mut layers = Vec::with_capacity(num_hidden_layers);
+        for i in 0..num_hidden_layers {
             layers.push(LayerWeights::new(
                 &ct,
                 reader,
-                cfg,
+                num_attention_heads,
+                num_key_value_heads,
+                head_dim,
+                hidden_size,
+                rms_norm_eps,
                 rotary.clone(),
                 i,
                 device,
@@ -458,11 +503,11 @@ impl ModelWeights {
         // Load final norm
         let norm = RmsNorm::from_qtensor(
             ct.tensor(reader, "model.norm.weight", device)?,
-            cfg.rms_norm_eps,
+            rms_norm_eps,
         )?;
 
         // Load lm_head weights
-        let lm_head_tensor = if cfg.tie_word_embeddings {
+        let lm_head_tensor = if tie_word_embeddings {
             ct.tensor(reader, "model.embed_tokens.weight", device)?
         } else {
             ct.tensor(reader, "lm_head.weight", device)?
