@@ -434,7 +434,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        // Print all metadata keys to help debug
+        // Print metadata keys to help debug
         println!("==== First 50 GGUF Metadata Keys ====");
         let interested_prefixes = [
             "general",
@@ -466,63 +466,80 @@ impl ModelWeights {
         }
         println!("===========================");
 
-        // Extract configuration from metadata
+        // Follow gemma3's approach strictly - use md_get with bail on missing
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 
-        // Get required configuration parameters
-        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
-        let num_hidden_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
-        let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
-        let num_key_value_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
-        let head_dim = md_get("qwen3.attention.head_size")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_theta = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
+        // Extract required parameters, bail if missing
+        let num_kv_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
+        let head_dim = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
         let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
+        let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
 
-        // Optional parameters with defaults
-        let tie_word_embeddings = ct
-            .metadata
-            .get("qwen3.tied_weights")
-            .and_then(|v| v.to_bool().ok())
-            .unwrap_or(false);
+        // Since we don't have head_count metadata, we need to compute it
+        // Qwen typically has 8x kv ratio for attention heads
+        let num_attention_heads = num_kv_heads * 8;
 
-        // Pick computation dtype: F32 if metadata code 0, else F16
-        let dtype = ct
-            .metadata
-            .get("general.dtype")
-            .and_then(|v| v.to_u32().ok())
-            .map(|code| match code {
-                0 => DType::F32, // GGML F32
-                1 => DType::F16, // GGML F16
-                _ => DType::F16, // other (quantized), use F16
-            })
-            .unwrap_or(DType::F32);
+        // Count layers from the model tensors - same as gemma3
+        let mut num_layers = 0;
+        for i in 0..100 {
+            let layer_path = format!("model.layers.{i}.input_layernorm.weight");
+            if ct.tensor_infos.contains_key(&layer_path) {
+                num_layers = i + 1;
+            } else {
+                break;
+            }
+        }
 
-        // Load embedding weights - dequantize to use in standard Embedding
+        if num_layers == 0 {
+            candle::bail!("could not find any model layers");
+        }
+
+        // Get embedding size from first layer
         let embed_tensor = ct.tensor(reader, "model.embed_tokens.weight", device)?;
-        let embed_tensor = embed_tensor.dequantize(device)?;
-        let embed_tokens = Embedding::new(embed_tensor, hidden_size);
+        let hidden_size = match embed_tensor.shape().dims().last() {
+            Some(&size) => size,
+            None => candle::bail!("invalid embedding tensor shape"),
+        };
+        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+
+        // Selection of compute dtype - mimic gemma3
+        let dtype = match ct.metadata.get("general.dtype") {
+            Some(v) => match v.to_u32() {
+                Ok(0) => DType::F32, // GGML F32
+                Ok(1) => DType::F16, // GGML F16
+                _ => DType::F16,     // Default to F16 for quantized
+            },
+            None => DType::F16, // Default to F16 if missing
+        };
 
         // Create rotary embedding
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
             dtype,
             head_dim,
             max_position_embeddings,
-            rope_theta,
+            rope_freq_base,
             device,
         )?);
 
-        // Load decoder layers
-        let mut layers = Vec::with_capacity(num_hidden_layers);
-        for i in 0..num_hidden_layers {
+        println!("Model configuration:");
+        println!("  layers: {}", num_layers);
+        println!("  hidden_size: {}", hidden_size);
+        println!("  attention_heads: {}", num_attention_heads);
+        println!("  kv_heads: {}", num_kv_heads);
+        println!("  head_dim: {}", head_dim);
+
+        // Load all layers
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
             layers.push(LayerWeights::new(
                 &ct,
                 reader,
                 num_attention_heads,
-                num_key_value_heads,
+                num_kv_heads,
                 head_dim,
                 hidden_size,
                 rms_norm_eps,
@@ -538,11 +555,10 @@ impl ModelWeights {
             rms_norm_eps,
         )?;
 
-        // Load lm_head weights
-        let lm_head_tensor = if tie_word_embeddings {
-            ct.tensor(reader, "model.embed_tokens.weight", device)?
-        } else {
-            ct.tensor(reader, "lm_head.weight", device)?
+        // Check if lm_head.weight exists
+        let lm_head_tensor = match ct.tensor_infos.contains_key("lm_head.weight") {
+            true => ct.tensor(reader, "lm_head.weight", device)?,
+            false => ct.tensor(reader, "model.embed_tokens.weight", device)?, // Fallback to tied weights
         };
         let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
 
