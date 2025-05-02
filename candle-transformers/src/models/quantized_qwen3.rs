@@ -434,34 +434,57 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        // Print metadata keys to help debug
-        println!("==== First 50 GGUF Metadata Keys ====");
-        let interested_prefixes = [
-            "general",
-            "qwen",
-            "llama",
-            "model",
-            "tokenizer",
-            "attention",
-            "token",
-        ];
-        let mut count = 0;
+        // Create a simplified approach to examine metadata
+        println!("==== GGUF Metadata Analysis ====");
 
-        for (key, value) in ct.metadata.iter() {
-            // Print first 50 keys
-            if count < 50 {
-                println!("Key: '{}' => {:?}", key, value);
-                count += 1;
+        // Group keys by prefix and print
+        let mut by_prefix: std::collections::HashMap<&str, Vec<&String>> =
+            std::collections::HashMap::new();
+
+        // First pass: organize keys by prefix
+        for key in ct.metadata.keys() {
+            let prefix = key.split('.').next().unwrap_or("");
+            by_prefix.entry(prefix).or_default().push(key);
+        }
+
+        // Print summary of prefixes
+        println!("Metadata by prefix:");
+        let mut prefixes: Vec<_> = by_prefix.keys().collect();
+        prefixes.sort();
+
+        for &prefix in &prefixes {
+            let keys = by_prefix.get(prefix).unwrap();
+            println!("  {}: {} keys", prefix, keys.len());
+        }
+
+        // Print all qwen keys - these are most likely to contain our model config
+        println!("\nAll qwen-related keys:");
+        if let Some(keys) = by_prefix.get("qwen3") {
+            for &key in keys {
+                if let Some(value) = ct.metadata.get(key) {
+                    println!("  {}: {:?}", key, value);
+                }
             }
+        } else {
+            println!("  No qwen3 keys found, searching for any qwen keys...");
+            for (prefix, keys) in &by_prefix {
+                if prefix.starts_with("qwen") {
+                    for &key in keys {
+                        if let Some(value) = ct.metadata.get(key) {
+                            println!("  {}: {:?}", key, value);
+                        }
+                    }
+                }
+            }
+        }
 
-            // Always print keys that might be relevant for model config
-            // regardless of the 50 limit
-            if count >= 50
-                && interested_prefixes
-                    .iter()
-                    .any(|prefix| key.starts_with(prefix))
-            {
-                println!("CONFIG KEY: '{}' => {:?}", key, value);
+        // Print general metadata
+        println!("\nGeneral model information:");
+        if let Some(keys) = by_prefix.get("general") {
+            for &key in keys {
+                if let Some(value) = ct.metadata.get(key) {
+                    println!("  {}: {:?}", key, value);
+                }
             }
         }
         println!("===========================");
@@ -472,39 +495,16 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        // Extract required parameters, bail if missing
+        // Extract required parameters using the exact keys we found in the metadata
+        let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
         let num_kv_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
         let head_dim = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
+        let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
+        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
+        let intermediate_size = md_get("qwen3.feed_forward_length")?.to_u32()? as usize;
         let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
-
-        // Since we don't have head_count metadata, we need to compute it
-        // Qwen typically has 8x kv ratio for attention heads
-        let num_attention_heads = num_kv_heads * 8;
-
-        // Count layers from the model tensors - same as gemma3
-        let mut num_layers = 0;
-        for i in 0..100 {
-            let layer_path = format!("model.layers.{i}.input_layernorm.weight");
-            if ct.tensor_infos.contains_key(&layer_path) {
-                num_layers = i + 1;
-            } else {
-                break;
-            }
-        }
-
-        if num_layers == 0 {
-            candle::bail!("could not find any model layers");
-        }
-
-        // Get embedding size from first layer
-        let embed_tensor = ct.tensor(reader, "model.embed_tokens.weight", device)?;
-        let hidden_size = match embed_tensor.shape().dims().last() {
-            Some(&size) => size,
-            None => candle::bail!("invalid embedding tensor shape"),
-        };
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
 
         // Selection of compute dtype - mimic gemma3
         let dtype = match ct.metadata.get("general.dtype") {
@@ -516,6 +516,10 @@ impl ModelWeights {
             None => DType::F16, // Default to F16 if missing
         };
 
+        // Load embeddings
+        let embed_tensor = ct.tensor(reader, "model.embed_tokens.weight", device)?;
+        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+
         // Create rotary embedding
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
             dtype,
@@ -525,12 +529,16 @@ impl ModelWeights {
             device,
         )?);
 
-        println!("Model configuration:");
+        println!("\nModel configuration from metadata:");
         println!("  layers: {}", num_layers);
         println!("  hidden_size: {}", hidden_size);
+        println!("  intermediate_size: {}", intermediate_size);
         println!("  attention_heads: {}", num_attention_heads);
         println!("  kv_heads: {}", num_kv_heads);
         println!("  head_dim: {}", head_dim);
+        println!("  max_position_embeddings: {}", max_position_embeddings);
+        println!("  rms_norm_eps: {}", rms_norm_eps);
+        println!("  rope_freq_base: {}", rope_freq_base);
 
         // Load all layers
         let mut layers = Vec::with_capacity(num_layers);
