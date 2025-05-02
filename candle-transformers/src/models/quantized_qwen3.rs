@@ -435,9 +435,34 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         // Print all metadata keys to help debug
-        println!("==== GGUF Metadata Keys ====");
+        println!("==== First 50 GGUF Metadata Keys ====");
+        let interested_prefixes = [
+            "general",
+            "qwen",
+            "llama",
+            "model",
+            "tokenizer",
+            "attention",
+            "token",
+        ];
+        let mut count = 0;
+
         for (key, value) in ct.metadata.iter() {
-            println!("Key: '{}' => {:?}", key, value);
+            // Print first 50 keys
+            if count < 50 {
+                println!("Key: '{}' => {:?}", key, value);
+                count += 1;
+            }
+
+            // Always print keys that might be relevant for model config
+            // regardless of the 50 limit
+            if count >= 50
+                && interested_prefixes
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            {
+                println!("CONFIG KEY: '{}' => {:?}", key, value);
+            }
         }
         println!("===========================");
 
