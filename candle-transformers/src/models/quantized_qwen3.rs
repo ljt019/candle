@@ -101,8 +101,8 @@ impl Qwen3RotaryEmbedding {
     /// Apply RoPE (q, k shape: B x H x L x D)
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
+        let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
+        let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
