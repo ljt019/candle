@@ -434,6 +434,13 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        // Print all metadata keys to help debug
+        println!("==== GGUF Metadata Keys ====");
+        for (key, value) in ct.metadata.iter() {
+            println!("Key: '{}' => {:?}", key, value);
+        }
+        println!("===========================");
+
         // Extract configuration from metadata
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
