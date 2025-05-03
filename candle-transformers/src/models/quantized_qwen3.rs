@@ -671,6 +671,6 @@ impl ModelWeights {
         let last_hidden = h.narrow(1, l - 1, 1)?;
 
         // Project to vocabulary
-        self.lm_head.forward(&last_hidden)
+        self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 }
