@@ -428,92 +428,6 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        // Create a simplified approach to examine metadata
-        println!("==== GGUF Metadata Analysis ====");
-
-        // Group keys by prefix and print
-        let mut by_prefix: std::collections::HashMap<&str, Vec<&String>> =
-            std::collections::HashMap::new();
-
-        // First pass: organize keys by prefix
-        for key in ct.metadata.keys() {
-            let prefix = key.split('.').next().unwrap_or("");
-            by_prefix.entry(prefix).or_default().push(key);
-        }
-
-        // Print summary of prefixes
-        println!("Metadata by prefix:");
-        let mut prefixes: Vec<_> = by_prefix.keys().collect();
-        prefixes.sort();
-
-        for &prefix in &prefixes {
-            let keys = by_prefix.get(prefix).unwrap();
-            println!("  {}: {} keys", prefix, keys.len());
-        }
-
-        // Print all qwen keys - these are most likely to contain our model config
-        println!("\nAll qwen-related keys:");
-        if let Some(keys) = by_prefix.get("qwen3") {
-            for &key in keys {
-                if let Some(value) = ct.metadata.get(key) {
-                    println!("  {}: {:?}", key, value);
-                }
-            }
-        } else {
-            println!("  No qwen3 keys found, searching for any qwen keys...");
-            for (prefix, keys) in &by_prefix {
-                if prefix.starts_with("qwen") {
-                    for &key in keys {
-                        if let Some(value) = ct.metadata.get(key) {
-                            println!("  {}: {:?}", key, value);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Print general metadata
-        println!("\nGeneral model information:");
-        if let Some(keys) = by_prefix.get("general") {
-            for &key in keys {
-                if let Some(value) = ct.metadata.get(key) {
-                    println!("  {}: {:?}", key, value);
-                }
-            }
-        }
-
-        // Print tensor names to help find embeddings
-        println!("\nTensors in the model file:");
-        let mut tensor_names: Vec<String> = ct.tensor_infos.keys().cloned().collect();
-        tensor_names.sort();
-
-        let possible_embedding_names = [
-            "token_embd.weight",
-            "model.embed_tokens.weight",
-            "embedding.weight",
-            "embed_tokens.weight",
-            "token_embeddings.weight",
-        ];
-
-        let mut embedding_tensor_name = "token_embd.weight"; // Default to common GGUF name
-
-        for name in &tensor_names {
-            // Print tensor info
-            if let Some(info) = ct.tensor_infos.get(name) {
-                let shape_str = format!("{:?}", &info.shape);
-                println!("  {} - {}", name, shape_str);
-
-                // Try to identify embedding tensor by checking for known names
-                if possible_embedding_names.contains(&name.as_str()) {
-                    embedding_tensor_name = name;
-                    println!("    ^ Likely embedding tensor");
-                }
-            }
-        }
-        println!("===========================");
-
-        println!("Using embedding tensor: {}", embedding_tensor_name);
-
         // Follow gemma3's approach strictly - use md_get with bail on missing
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -542,7 +456,7 @@ impl ModelWeights {
         };
 
         // Load embeddings using the name we found
-        let embed_tensor = ct.tensor(reader, embedding_tensor_name, device)?;
+        let embed_tensor = ct.tensor(reader, "token_embd.weight", device)?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
 
         // Create rotary embedding
@@ -553,17 +467,6 @@ impl ModelWeights {
             rope_freq_base,
             device,
         )?);
-
-        println!("\nModel configuration from metadata:");
-        println!("  layers: {}", num_layers);
-        println!("  hidden_size: {}", hidden_size);
-        println!("  intermediate_size: {}", intermediate_size);
-        println!("  attention_heads: {}", num_attention_heads);
-        println!("  kv_heads: {}", num_kv_heads);
-        println!("  head_dim: {}", head_dim);
-        println!("  max_position_embeddings: {}", max_position_embeddings);
-        println!("  rms_norm_eps: {}", rms_norm_eps);
-        println!("  rope_freq_base: {}", rope_freq_base);
 
         // Load all layers
         let mut layers = Vec::with_capacity(num_layers);
@@ -588,22 +491,10 @@ impl ModelWeights {
             rms_norm_eps,
         )?;
 
-        // Check for output projection tensor: output.weight -> lm_head.weight -> tied embeddings
+        // Load output projection tensor, falling back to tied embeddings like gemma3
         let lm_head_tensor = match ct.tensor(reader, "output.weight", device) {
-            Ok(tensor) => {
-                println!("Using output.weight for output projection.");
-                tensor
-            }
-            Err(_) => match ct.tensor(reader, "lm_head.weight", device) {
-                Ok(tensor) => {
-                    println!("Using lm_head.weight for output projection.");
-                    tensor
-                }
-                Err(_) => {
-                    println!("Neither output.weight nor lm_head.weight found. Tying output projection to token embeddings.");
-                    ct.tensor(reader, embedding_tensor_name, device)?
-                }
-            },
+            Ok(tensor) => tensor,
+            Err(_) => ct.tensor(reader, "token_embd.weight", device)?,
         };
         let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
 
