@@ -247,6 +247,9 @@ impl AttentionWeights {
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
         // 5. Accumulate KV cache - KvCache operates on Tensor
+        if offset == 0 {
+            self.kv_cache.reset();
+        }
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         // 6. GQA repeat_kv - operates on Tensor
@@ -403,10 +406,6 @@ impl LayerWeights {
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
         x + h2
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -612,12 +611,6 @@ impl ModelWeights {
             span,
             span_output,
         })
-    }
-
-    fn clear_kv_cache(&mut self) {
-        for l in &mut self.layers {
-            l.clear_kv_cache();
-        }
     }
 
     fn causal_mask(
