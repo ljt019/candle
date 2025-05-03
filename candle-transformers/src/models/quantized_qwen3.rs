@@ -588,13 +588,22 @@ impl ModelWeights {
             rms_norm_eps,
         )?;
 
-        // Check if lm_head.weight exists, otherwise use embedding weights
-        let lm_head_tensor = match ct.tensor_infos.contains_key("lm_head.weight") {
-            true => ct.tensor(reader, "lm_head.weight", device)?,
-            false => {
-                println!("lm_head.weight not found, using embeddings for output projection");
-                ct.tensor(reader, embedding_tensor_name, device)?
+        // Check for output projection tensor: output.weight -> lm_head.weight -> tied embeddings
+        let lm_head_tensor = match ct.tensor(reader, "output.weight", device) {
+            Ok(tensor) => {
+                println!("Using output.weight for output projection.");
+                tensor
             }
+            Err(_) => match ct.tensor(reader, "lm_head.weight", device) {
+                Ok(tensor) => {
+                    println!("Using lm_head.weight for output projection.");
+                    tensor
+                }
+                Err(_) => {
+                    println!("Neither output.weight nor lm_head.weight found. Tying output projection to token embeddings.");
+                    ct.tensor(reader, embedding_tensor_name, device)?
+                }
+            },
         };
         let lm_head = QMatMulWrapper::from_qtensor(lm_head_tensor)?;
 
