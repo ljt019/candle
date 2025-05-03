@@ -9,7 +9,7 @@
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::gguf_file;
 use candle::quantized::QTensor;
-use candle::{DType, Device, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor};
 use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -199,7 +199,6 @@ impl AttentionWeights {
     ) -> Result<Self> {
         let num_kv_groups = num_heads / num_kv_heads;
 
-        // Load QTensor weights and convert to QMatMul wrappers
         let q_proj = QMatMulWrapper::from_qtensor(ct.tensor(
             reader,
             &format!("{prefix}.attn_q.weight"),
@@ -221,7 +220,6 @@ impl AttentionWeights {
             device,
         )?)?;
 
-        // Load QTensor norm weights
         let q_norm = RmsNorm::from_qtensor(
             ct.tensor(reader, &format!("{prefix}.attn_q_norm.weight"), device)?,
             rms_norm_eps,
@@ -272,17 +270,18 @@ impl AttentionWeights {
 
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(D::Minus2, D::Minus1)?;
+            .transpose(1, 2)?;
         let k = k
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(D::Minus2, D::Minus1)?;
+            .transpose(1, 2)?;
         let v = v
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(D::Minus2, D::Minus1)?;
+            .transpose(1, 2)?;
 
-        let q_flat = q.flatten(0, D::Minus2)?; // (B*H, L, D) -> if we transpose later, it becomes (BHL, D), or keep as (B*H, L, D)
-        let k_flat = k.flatten(0, D::Minus2)?; // Qwen applies norm *before* transpose(1,2) according to some sources,
-        let q_flat = self.q_norm.forward(&q_flat)?; // Norm applied over the last dimension (HeadDim)
+        let q_flat = q.flatten(0, 2)?;
+        let k_flat = k.flatten(0, 2)?;
+
+        let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
@@ -299,7 +298,7 @@ impl AttentionWeights {
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
             let m_dtype = m.dtype();
             let scores_dtype = scores.dtype();
@@ -312,14 +311,10 @@ impl AttentionWeights {
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
-        let reshaped_ctx =
-            ctx.transpose(D::Minus2, D::Minus1)?
-                .reshape((b, l, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&reshaped_ctx) // (B, L, H*D) -> (B, L, D)
-    }
-
-    pub(crate) fn clear_kv_cache(&mut self) {
-        self.kv_cache.reset();
+        let reshaped_ctx = ctx
+            .transpose(1, 2)?
+            .reshape((b, l, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&reshaped_ctx)
     }
 }
 
@@ -524,9 +519,8 @@ impl ModelWeights {
         let h = self.norm.forward(&h)?;
 
         let _enter = self.span_output.enter();
-        let last_hidden = h.narrow(D::Minus1, l - 1, 1)?;
+        let last_hidden = h.narrow(1, l - 1, 1)?;
 
-        // Project to vocabulary
-        self.lm_head.forward(&last_hidden)?.squeeze(D::Minus1)
+        self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 }
